@@ -39,17 +39,18 @@
 <div class="row" style="flex-direction:column; align-items:stretch">
   <label>Яркость: <span id="brightVal">100</span>%</label>
   <input type="range" id="bright" min="0" max="100" value="100">
-  <label>Скорость эффекта: <span id="speedVal">5</span></label>
+  <label>Скорость: <span id="speedVal">5</span></label>
   <input type="range" id="speed" min="1" max="10" value="5">
 </div>
 
 <h3>Мои цвета</h3>
 <div class="swatches" id="swatches"></div>
-<div class="status">Нажми цвет — применить. Долгое нажатие — удалить. Цвет 1 и Цвет 2 (справа от кнопок) используются в переливании.</div>
+<div class="status">Цвет 1 и Цвет 2 используются в эффектах. Долгое нажатие на цвет — удалить.</div>
 
 <h3>Эффекты</h3>
 <div class="row">
   <button data-fx="gradient">Переливание</button>
+  <button data-fx="wave">Волна</button>
   <button data-fx="rainbow">Радуга</button>
   <button data-fx="pulse">Пульс</button>
   <button id="stopfx">Стоп</button>
@@ -60,8 +61,12 @@ const SERVICE = '0000fff0-0000-1000-8000-00805f9b34fb';
 const CHAR = '0000fff3-0000-1000-8000-00805f9b34fb';
 
 let characteristic = null, device = null;
-let busy = false, anim = null, brightPct = 100, phase = 0;
+let brightPct = 100;
 let savedColors = JSON.parse(localStorage.getItem('ledColors') || '[]');
+
+// Очередь: храним только последний кадр, лишние кадры пропускаем
+let pending = null;      // [r,g,b] ещё не отправленный кадр
+let writing = false;
 
 const $ = id => document.getElementById(id);
 const setStatus = msg => $('status').textContent = msg;
@@ -81,23 +86,30 @@ async function connect() {
   }
 }
 
-async function send(bytes) {
-  if (!characteristic || busy) return;
-  busy = true;
+async function sendRaw(bytes) {
+  if (!characteristic) { setStatus('Сначала подключитесь'); return; }
+  await characteristic.writeValueWithoutResponse(new Uint8Array(bytes));
+}
+
+// Отправитель: раз в 60 мс шлёт последний кадр, если предыдущая запись завершилась
+setInterval(async () => {
+  if (!characteristic || writing || !pending) return;
+  const [r, g, b] = pending;
+  pending = null;
+  writing = true;
   try {
-    await characteristic.writeValueWithoutResponse(new Uint8Array(bytes));
+    await sendRaw([0x7E, 0x00, 0x05, 0x03, r, g, b, 0x00, 0xEF]);
   } catch (e) {
     setStatus('Ошибка записи: ' + e.message);
   } finally {
-    busy = false;
+    writing = false;
   }
-}
+}, 60);
 
-// отправка RGB с учётом яркости
-function sendRGB(r, g, b) {
+// Ставит кадр в очередь с учётом яркости
+function setFrame(r, g, b) {
   const k = brightPct / 100;
-  send([0x7E, 0x00, 0x05, 0x03,
-    Math.round(r * k), Math.round(g * k), Math.round(b * k), 0x00, 0xEF]);
+  pending = [Math.round(r * k), Math.round(g * k), Math.round(b * k)];
 }
 
 const hexToRgb = hex => [
@@ -106,53 +118,50 @@ const hexToRgb = hex => [
   parseInt(hex.slice(5, 7), 16)
 ];
 
-const lerp = (a, b, p) => a + (b - a) * p;
+const mix = (a, b, t) => [0, 1, 2].map(i => a[i] + (b[i] - a[i]) * t);
+const ease = p => (1 - Math.cos(p)) / 2; // плавный переход туда-обратно
 
-function hsvToRgb(h, s, v) {
-  const f = n => {
-    const k = (n + h / 60) % 6;
-    return v - v * s * Math.max(0, Math.min(k, 4 - k, 1));
-  };
-  return [f(5) * 255, f(3) * 255, f(1) * 255];
+function hsvToRgb(h) {
+  const k = n => Math.max(0, Math.min(1, Math.min((h / 60 + n) % 6, 4 - (h / 60 + n) % 6, 1)));
+  return [k(5) * 255, k(3) * 255, k(1) * 255];
 }
 
+// Эффекты: fx(t) где t — время в секундах, возвращает [r,g,b]
+const effects = {
+  gradient: t => mix(hexToRgb($('picker').value), hexToRgb($('picker2').value), ease(t * Math.PI * 2)),
+  wave:     t => {
+    const a = hexToRgb($('picker').value), b = hexToRgb($('picker2').value);
+    const k = ease(t * Math.PI * 2);
+    return mix(a, b, k * k); // чуть дольше держится на каждом цвете
+  },
+  rainbow:  t => hsvToRgb((t * 40) % 360),
+  pulse:    t => hexToRgb($('picker').value).map(v => v * ease(t * Math.PI * 2))
+};
+
+let animId = null, animName = null, startTime = 0;
+
 function stopAnim() {
-  if (anim) { clearInterval(anim); anim = null; }
+  if (animId) cancelAnimationFrame(animId);
+  animId = null; animName = null;
   document.querySelectorAll('[data-fx]').forEach(b => b.classList.remove('active'));
 }
 
-// запуск эффекта: fn(phase) возвращает [r,g,b]
-function startAnim(name, fn) {
+// Плавный цикл через requestAnimationFrame, время берётся реальное
+function loop(now) {
+  const speed = +$('speed').value;      // 1..10
+  const cyclesPerSec = 0.05 + speed * 0.03; // медленно при 1, быстрее при 10
+  const t = (now - startTime) / 1000 * cyclesPerSec;
+  const [r, g, b] = effects[animName](t);
+  setFrame(r, g, b);
+  animId = requestAnimationFrame(loop);
+}
+
+function startAnim(name) {
   stopAnim();
-  phase = 0;
+  animName = name;
+  startTime = performance.now();
   document.querySelector(`[data-fx="${name}"]`).classList.add('active');
-  const speed = +$('speed').value;
-  const interval = 400 - speed * 30; // 370 мс при скорости 1, 100 мс при 10
-  anim = setInterval(() => {
-    const [r, g, b] = fn(phase);
-    sendRGB(r, g, b);
-    phase += 0.05 + speed * 0.01;
-  }, interval);
-}
-
-// Переливание: плавный переход от Цвет 1 к Цвет 2 и обратно
-function gradientFx(p) {
-  const a = hexToRgb($('picker').value);
-  const b = hexToRgb($('picker2').value);
-  const t = (1 - Math.cos(p)) / 2;
-  return [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
-}
-
-// Радуга: плавный переход по всему цветовому кругу
-function rainbowFx(p) {
-  return hsvToRgb((p * 60) % 360, 1, 1);
-}
-
-// Пульс: Цвет 1 плавно затухает и загорается
-function pulseFx(p) {
-  const a = hexToRgb($('picker').value);
-  const k = (1 - Math.cos(p)) / 2;
-  return a.map(v => v * k);
+  animId = requestAnimationFrame(loop);
 }
 
 function renderSwatches() {
@@ -162,7 +171,7 @@ function renderSwatches() {
     const el = document.createElement('div');
     el.className = 'swatch';
     el.style.background = hex;
-    el.onclick = () => { stopAnim(); $('picker').value = hex; sendRGB(...hexToRgb(hex)); };
+    el.onclick = () => { stopAnim(); $('picker').value = hex; setFrame(...hexToRgb(hex)); };
     el.oncontextmenu = e => {
       e.preventDefault();
       savedColors.splice(i, 1);
@@ -174,11 +183,10 @@ function renderSwatches() {
 }
 
 $('connect').onclick = connect;
-$('on').onclick = () => { send([0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF]); };
-$('off').onclick = () => { stopAnim(); send([0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEF]); };
+$('on').onclick = () => sendRaw([0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF]).catch(e => setStatus(e.message));
+$('off').onclick = () => { stopAnim(); sendRaw([0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEF]).catch(e => setStatus(e.message)); };
 $('stopfx').onclick = stopAnim;
-
-$('apply').onclick = () => { stopAnim(); sendRGB(...hexToRgb($('picker').value)); };
+$('apply').onclick = () => { stopAnim(); setFrame(...hexToRgb($('picker').value)); };
 
 $('save').onclick = () => {
   const hex = $('picker').value;
@@ -194,18 +202,10 @@ $('bright').oninput = e => {
   $('brightVal').textContent = brightPct;
 };
 
-$('speed').oninput = e => {
-  $('speedVal').textContent = e.target.value;
-  if (anim) {
-    const name = document.querySelector('[data-fx].active').dataset.fx;
-    startAnim(name, fxs[name]);
-  }
-};
-
-const fxs = { gradient: gradientFx, rainbow: rainbowFx, pulse: pulseFx };
+$('speed').oninput = e => { $('speedVal').textContent = e.target.value; };
 
 document.querySelectorAll('[data-fx]').forEach(btn => {
-  btn.onclick = () => startAnim(btn.dataset.fx, fxs[btn.dataset.fx]);
+  btn.onclick = () => startAnim(btn.dataset.fx);
 });
 
 renderSwatches();
