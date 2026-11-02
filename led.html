@@ -7,8 +7,10 @@
 <style>
   body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 0; padding: 16px; }
   h1 { font-size: 20px; margin: 0 0 12px; }
+  h3 { margin: 18px 0 8px; font-size: 16px; }
   button { background: #333; color: #eee; border: none; border-radius: 10px; padding: 12px; font-size: 15px; margin: 4px; cursor: pointer; }
   button:active { background: #555; }
+  button.active { background: #2a6df4; }
   .row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 14px; }
   input[type=color] { width: 60px; height: 44px; border: none; background: none; padding: 0; }
   input[type=range] { width: 100%; }
@@ -29,36 +31,40 @@
 
 <div class="row">
   <input type="color" id="picker" value="#ff0000">
+  <input type="color" id="picker2" value="#0000ff">
   <button id="apply">Применить цвет</button>
-  <button id="save">Сохранить цвет</button>
+  <button id="save">Сохранить</button>
 </div>
 
 <div class="row" style="flex-direction:column; align-items:stretch">
   <label>Яркость: <span id="brightVal">100</span>%</label>
   <input type="range" id="bright" min="0" max="100" value="100">
+  <label>Скорость эффекта: <span id="speedVal">5</span></label>
+  <input type="range" id="speed" min="1" max="10" value="5">
 </div>
 
 <h3>Мои цвета</h3>
 <div class="swatches" id="swatches"></div>
+<div class="status">Нажми цвет — применить. Долгое нажатие — удалить. Цвет 1 и Цвет 2 (справа от кнопок) используются в переливании.</div>
 
 <h3>Эффекты</h3>
 <div class="row">
-  <button data-fx="0x80">Плавная смена</button>
-  <button data-fx="0x81">Вспышки</button>
-  <button data-fx="0x82">Пульс</button>
-  <button data-fx="0x83">Радуга</button>
+  <button data-fx="gradient">Переливание</button>
+  <button data-fx="rainbow">Радуга</button>
+  <button data-fx="pulse">Пульс</button>
+  <button id="stopfx">Стоп</button>
 </div>
 
 <script>
 const SERVICE = '0000fff0-0000-1000-8000-00805f9b34fb';
 const CHAR = '0000fff3-0000-1000-8000-00805f9b34fb';
 
-let characteristic = null;
-let device = null;
+let characteristic = null, device = null;
+let busy = false, anim = null, brightPct = 100, phase = 0;
 let savedColors = JSON.parse(localStorage.getItem('ledColors') || '[]');
 
 const $ = id => document.getElementById(id);
-const status = msg => $('status').textContent = msg;
+const setStatus = msg => $('status').textContent = msg;
 
 async function connect() {
   try {
@@ -69,15 +75,29 @@ async function connect() {
     const server = await device.gatt.connect();
     const service = await server.getPrimaryService(SERVICE);
     characteristic = await service.getCharacteristic(CHAR);
-    status('Подключено: ' + device.name);
+    setStatus('Подключено: ' + device.name);
   } catch (e) {
-    status('Ошибка: ' + e.message);
+    setStatus('Ошибка: ' + e.message);
   }
 }
 
 async function send(bytes) {
-  if (!characteristic) { status('Сначала подключитесь'); return; }
-  await characteristic.writeValueWithoutResponse(new Uint8Array(bytes));
+  if (!characteristic || busy) return;
+  busy = true;
+  try {
+    await characteristic.writeValueWithoutResponse(new Uint8Array(bytes));
+  } catch (e) {
+    setStatus('Ошибка записи: ' + e.message);
+  } finally {
+    busy = false;
+  }
+}
+
+// отправка RGB с учётом яркости
+function sendRGB(r, g, b) {
+  const k = brightPct / 100;
+  send([0x7E, 0x00, 0x05, 0x03,
+    Math.round(r * k), Math.round(g * k), Math.round(b * k), 0x00, 0xEF]);
 }
 
 const hexToRgb = hex => [
@@ -86,17 +106,53 @@ const hexToRgb = hex => [
   parseInt(hex.slice(5, 7), 16)
 ];
 
-async function setColor(hex) {
-  const [r, g, b] = hexToRgb(hex);
-  await send([0x7E, 0x00, 0x05, 0x03, r, g, b, 0x00, 0xEF]);
+const lerp = (a, b, p) => a + (b - a) * p;
+
+function hsvToRgb(h, s, v) {
+  const f = n => {
+    const k = (n + h / 60) % 6;
+    return v - v * s * Math.max(0, Math.min(k, 4 - k, 1));
+  };
+  return [f(5) * 255, f(3) * 255, f(1) * 255];
 }
 
-async function setBrightness(percent) {
-  // Яркость масштабируем цветом: умножаем RGB на процент
-  const [r, g, b] = hexToRgb($('picker').value);
-  const k = percent / 100;
-  await send([0x7E, 0x00, 0x05, 0x03,
-    Math.round(r * k), Math.round(g * k), Math.round(b * k), 0x00, 0xEF]);
+function stopAnim() {
+  if (anim) { clearInterval(anim); anim = null; }
+  document.querySelectorAll('[data-fx]').forEach(b => b.classList.remove('active'));
+}
+
+// запуск эффекта: fn(phase) возвращает [r,g,b]
+function startAnim(name, fn) {
+  stopAnim();
+  phase = 0;
+  document.querySelector(`[data-fx="${name}"]`).classList.add('active');
+  const speed = +$('speed').value;
+  const interval = 400 - speed * 30; // 370 мс при скорости 1, 100 мс при 10
+  anim = setInterval(() => {
+    const [r, g, b] = fn(phase);
+    sendRGB(r, g, b);
+    phase += 0.05 + speed * 0.01;
+  }, interval);
+}
+
+// Переливание: плавный переход от Цвет 1 к Цвет 2 и обратно
+function gradientFx(p) {
+  const a = hexToRgb($('picker').value);
+  const b = hexToRgb($('picker2').value);
+  const t = (1 - Math.cos(p)) / 2;
+  return [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
+}
+
+// Радуга: плавный переход по всему цветовому кругу
+function rainbowFx(p) {
+  return hsvToRgb((p * 60) % 360, 1, 1);
+}
+
+// Пульс: Цвет 1 плавно затухает и загорается
+function pulseFx(p) {
+  const a = hexToRgb($('picker').value);
+  const k = (1 - Math.cos(p)) / 2;
+  return a.map(v => v * k);
 }
 
 function renderSwatches() {
@@ -106,8 +162,7 @@ function renderSwatches() {
     const el = document.createElement('div');
     el.className = 'swatch';
     el.style.background = hex;
-    el.title = 'Нажмите — применить, долгое нажатие — удалить';
-    el.onclick = () => { $('picker').value = hex; setColor(hex); };
+    el.onclick = () => { stopAnim(); $('picker').value = hex; sendRGB(...hexToRgb(hex)); };
     el.oncontextmenu = e => {
       e.preventDefault();
       savedColors.splice(i, 1);
@@ -119,9 +174,11 @@ function renderSwatches() {
 }
 
 $('connect').onclick = connect;
-$('on').onclick = () => send([0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF]);
-$('off').onclick = () => send([0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEF]);
-$('apply').onclick = () => setColor($('picker').value);
+$('on').onclick = () => { send([0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF]); };
+$('off').onclick = () => { stopAnim(); send([0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEF]); };
+$('stopfx').onclick = stopAnim;
+
+$('apply').onclick = () => { stopAnim(); sendRGB(...hexToRgb($('picker').value)); };
 
 $('save').onclick = () => {
   const hex = $('picker').value;
@@ -133,12 +190,22 @@ $('save').onclick = () => {
 };
 
 $('bright').oninput = e => {
-  $('brightVal').textContent = e.target.value;
-  setBrightness(+e.target.value);
+  brightPct = +e.target.value;
+  $('brightVal').textContent = brightPct;
 };
 
+$('speed').oninput = e => {
+  $('speedVal').textContent = e.target.value;
+  if (anim) {
+    const name = document.querySelector('[data-fx].active').dataset.fx;
+    startAnim(name, fxs[name]);
+  }
+};
+
+const fxs = { gradient: gradientFx, rainbow: rainbowFx, pulse: pulseFx };
+
 document.querySelectorAll('[data-fx]').forEach(btn => {
-  btn.onclick = () => send([0x7E, 0x00, 0x03, parseInt(btn.dataset.fx), 0x03, 0xFF, 0xFF, 0xFF, 0xEF].slice(0, 9));
+  btn.onclick = () => startAnim(btn.dataset.fx, fxs[btn.dataset.fx]);
 });
 
 renderSwatches();
